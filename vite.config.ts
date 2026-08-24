@@ -15,8 +15,23 @@ if (
   delete process.env.HOST;
 }
 
-const host = new URL(process.env.SHOPIFY_APP_URL || "http://localhost")
-  .hostname;
+function getHostname(urlValue: string | undefined): string {
+  const fallback = "http://localhost";
+  const raw = (urlValue || fallback).trim();
+  try {
+    return new URL(raw).hostname;
+  } catch {
+    // Vercel/build envs sometimes set SHOPIFY_APP_URL without a scheme
+    // (e.g. "my-app.vercel.app") or to an invalid value.
+    try {
+      return new URL(`https://${raw}`).hostname;
+    } catch {
+      return new URL(fallback).hostname;
+    }
+  }
+}
+
+const host = getHostname(process.env.SHOPIFY_APP_URL);
 
 let hmrConfig;
 if (host === "localhost") {
