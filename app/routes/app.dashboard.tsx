@@ -435,13 +435,31 @@ async function fetchRemoteRequestsFromApi(settings: TranslatorApiSettingsRow) {
   return merged;
 }
 
-export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { admin, session } = await authenticate.admin(request);
-  const [productResult, categoryResult, metafieldDefinitionsResult, requestsResult, cachedLanguagesResult, attributeIndexResult, localeMappingsResult] = await Promise.allSettled([
-    admin.graphql(
+type AdminGraphqlClient = {
+  graphql: (
+    query: string,
+    options?: { variables?: Record<string, unknown> },
+  ) => Promise<Response>;
+};
+
+const DASHBOARD_PAGE_SIZE = 250;
+const DASHBOARD_MAX_PAGES = 600;
+
+async function fetchAllDashboardProducts(admin: AdminGraphqlClient): Promise<ProductRow[]> {
+  const products: ProductRow[] = [];
+  let hasNextPage = true;
+  let cursor: string | null = null;
+  let pageCount = 0;
+
+  while (hasNextPage && pageCount < DASHBOARD_MAX_PAGES) {
+    const response = await admin.graphql(
       `#graphql
-      query DashboardProducts {
-        products(first: 50) {
+      query DashboardProducts($after: String) {
+        products(first: ${DASHBOARD_PAGE_SIZE}, after: $after) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
           edges {
             node {
               id
@@ -452,11 +470,52 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
           }
         }
       }`,
-    ),
-    admin.graphql(
+      { variables: { after: cursor } },
+    );
+    const json = (await response.json()) as {
+      data?: {
+        products?: {
+          pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+          edges?: Array<{
+            node: { id: string; title: string; handle: string; options?: Array<{ name: string }> };
+          }>;
+        };
+      };
+    };
+    const page = json.data?.products;
+    const edges = page?.edges ?? [];
+    for (const edge of edges) {
+      products.push({
+        id: edge.node.id,
+        numericId: edge.node.id.split("/").pop() ?? edge.node.id,
+        title: edge.node.title,
+        handle: edge.node.handle,
+        options: (edge.node.options ?? []).map((option) => option.name),
+      });
+    }
+    hasNextPage = Boolean(page?.pageInfo?.hasNextPage);
+    cursor = page?.pageInfo?.endCursor ?? null;
+    pageCount += 1;
+  }
+
+  return products;
+}
+
+async function fetchAllDashboardCategories(admin: AdminGraphqlClient): Promise<CategoryRow[]> {
+  const categories: CategoryRow[] = [];
+  let hasNextPage = true;
+  let cursor: string | null = null;
+  let pageCount = 0;
+
+  while (hasNextPage && pageCount < DASHBOARD_MAX_PAGES) {
+    const response = await admin.graphql(
       `#graphql
-      query DashboardCategories {
-        collections(first: 50) {
+      query DashboardCategories($after: String) {
+        collections(first: ${DASHBOARD_PAGE_SIZE}, after: $after) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
           edges {
             node {
               id
@@ -471,7 +530,96 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
           }
         }
       }`,
-    ),
+      { variables: { after: cursor } },
+    );
+    const json = (await response.json()) as {
+      data?: {
+        collections?: {
+          pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+          edges?: Array<{
+            node: {
+              id: string;
+              title: string;
+              handle: string;
+              descriptionHtml?: string | null;
+              seo?: { title?: string | null; description?: string | null } | null;
+            };
+          }>;
+        };
+      };
+    };
+    const page = json.data?.collections;
+    const edges = page?.edges ?? [];
+    for (const edge of edges) {
+      categories.push({
+        id: edge.node.id,
+        numericId: edge.node.id.split("/").pop() ?? edge.node.id,
+        title: edge.node.title,
+        handle: edge.node.handle,
+        description: String(edge.node.descriptionHtml ?? ""),
+        seoTitle: String(edge.node.seo?.title ?? ""),
+        seoDescription: String(edge.node.seo?.description ?? ""),
+      });
+    }
+    hasNextPage = Boolean(page?.pageInfo?.hasNextPage);
+    cursor = page?.pageInfo?.endCursor ?? null;
+    pageCount += 1;
+  }
+
+  return categories;
+}
+
+async function fetchAllProductIds(admin: AdminGraphqlClient): Promise<string[]> {
+  const ids: string[] = [];
+  let hasNextPage = true;
+  let cursor: string | null = null;
+  let pageCount = 0;
+
+  while (hasNextPage && pageCount < DASHBOARD_MAX_PAGES) {
+    const response = await admin.graphql(
+      `#graphql
+      query AttributeModeProducts($after: String) {
+        products(first: ${DASHBOARD_PAGE_SIZE}, after: $after, sortKey: UPDATED_AT, reverse: true) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+          edges {
+            node {
+              id
+            }
+          }
+        }
+      }`,
+      { variables: { after: cursor } },
+    );
+    const json = (await response.json()) as {
+      data?: {
+        products?: {
+          pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+          edges?: Array<{ node?: { id?: string | null } | null }>;
+        };
+      };
+    };
+    const page = json.data?.products;
+    const edges = page?.edges ?? [];
+    for (const edge of edges) {
+      const id = String(edge?.node?.id ?? "").trim();
+      if (id) ids.push(id);
+    }
+    hasNextPage = Boolean(page?.pageInfo?.hasNextPage);
+    cursor = page?.pageInfo?.endCursor ?? null;
+    pageCount += 1;
+  }
+
+  return ids;
+}
+
+export const loader = async ({ request }: LoaderFunctionArgs) => {
+  const { admin, session } = await authenticate.admin(request);
+  const [productResult, categoryResult, metafieldDefinitionsResult, requestsResult, cachedLanguagesResult, attributeIndexResult, localeMappingsResult] = await Promise.allSettled([
+    fetchAllDashboardProducts(admin),
+    fetchAllDashboardCategories(admin),
     admin.graphql(
       `#graphql
       query DashboardProductMetafieldDefinitions {
@@ -527,54 +675,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const localeMappings =
     localeMappingsResult.status === "fulfilled" ? localeMappingsResult.value : {};
 
-  const productJson = (
-    productResult.status === "fulfilled"
-      ? await productResult.value.json()
-      : { data: { products: { edges: [] } } }
-  ) as {
-    data?: {
-      products?: { edges?: Array<{ node: { id: string; title: string; handle: string; options?: Array<{ name: string }> } }> };
-    };
-  };
-
   const products: ProductRow[] =
-    productJson.data?.products?.edges?.map((edge) => ({
-      id: edge.node.id,
-      numericId: edge.node.id.split("/").pop() ?? edge.node.id,
-      title: edge.node.title,
-      handle: edge.node.handle,
-      options: (edge.node.options ?? []).map((option) => option.name),
-    })) ?? [];
+    productResult.status === "fulfilled" ? productResult.value : [];
 
-  const categoryJson = (
-    categoryResult.status === "fulfilled"
-      ? await categoryResult.value.json()
-      : { data: { collections: { edges: [] } } }
-  ) as {
-    data?: {
-      collections?: {
-        edges?: Array<{
-          node: {
-            id: string;
-            title: string;
-            handle: string;
-            descriptionHtml?: string | null;
-            seo?: { title?: string | null; description?: string | null } | null;
-          };
-        }>;
-      };
-    };
-  };
   const categories: CategoryRow[] =
-    categoryJson.data?.collections?.edges?.map((edge) => ({
-      id: edge.node.id,
-      numericId: edge.node.id.split("/").pop() ?? edge.node.id,
-      title: edge.node.title,
-      handle: edge.node.handle,
-      description: String(edge.node.descriptionHtml ?? ""),
-      seoTitle: String(edge.node.seo?.title ?? ""),
-      seoDescription: String(edge.node.seo?.description ?? ""),
-    })) ?? [];
+    categoryResult.status === "fulfilled" ? categoryResult.value : [];
 
   const metafieldDefinitionsJson = (
     metafieldDefinitionsResult.status === "fulfilled"
@@ -1799,28 +1904,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     } satisfies ActionData;
   }
   if (isAttributeMode && !selectedItems.length) {
-    const attributeProductsResponse = await admin.graphql(
-      `#graphql
-      query AttributeModeProducts {
-        products(first: 50, sortKey: UPDATED_AT, reverse: true) {
-          edges {
-            node {
-              id
-            }
-          }
-        }
-      }`,
-    );
-    const attributeProductsJson = (await attributeProductsResponse.json()) as {
-      data?: {
-        products?: {
-          edges?: Array<{ node?: { id?: string | null } | null }>;
-        };
-      };
-    };
-    selectedItems = (attributeProductsJson.data?.products?.edges ?? [])
-      .map((edge) => String(edge?.node?.id ?? "").trim())
-      .filter(Boolean);
+    selectedItems = await fetchAllProductIds(admin);
     if (!selectedItems.length) {
       return {
         ok: false,
