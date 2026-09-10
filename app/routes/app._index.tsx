@@ -233,7 +233,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     const localesJson = (await localesResponse.json()) as {
       data?: { shopLocales?: StoreLocaleRow[] };
     };
-    storeLocales = (localesJson.data?.shopLocales ?? []).filter((locale) => locale.published);
+    storeLocales = localesJson.data?.shopLocales ?? [];
   } catch {
     localeAccessLimited = true;
   }
@@ -602,7 +602,7 @@ export default function Index() {
 
             {!localeAccessLimited && !storeLocales.length ? (
               <s-paragraph>
-                No published store languages found. Add/publish languages in Shopify settings first.
+                No store languages found. Add languages in Shopify settings first.
               </s-paragraph>
             ) : null}
 
@@ -650,6 +650,7 @@ export default function Index() {
                         <td style={{ padding: "6px 8px", borderBottom: "1px solid #f3f4f6", verticalAlign: "middle" }}>
                           {locale.name} ({locale.locale})
                           {locale.primary ? " — Default" : ""}
+                          {locale.published ? "" : " — Unpublished"}
                         </td>
                         <td style={{ padding: "6px 8px", borderBottom: "1px solid #f3f4f6", verticalAlign: "middle" }}>
                           <select
