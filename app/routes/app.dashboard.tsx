@@ -21,7 +21,16 @@ type ProductRow = {
   options: string[];
   metafieldKeys: string[];
 };
-type CategoryRow = { id: string; numericId: string; title: string; handle: string; description: string; seoTitle: string; seoDescription: string };
+type CategoryRow = {
+  id: string;
+  numericId: string;
+  title: string;
+  handle: string;
+  description: string;
+  seoTitle: string;
+  seoDescription: string;
+  metafieldKeys: string[];
+};
 type ProductOptionValueRow = { id: string; name: string };
 type ProductOptionRow = { id: string; name: string; optionValues?: ProductOptionValueRow[] };
 type AttributePickerOption = { value: string; label: string };
@@ -243,6 +252,59 @@ const TEXT_METAFIELD_TYPES = new Set([
 
 function metafieldSelectValue(namespace: string, key: string) {
   return `mf__${toFieldKey(namespace)}__${toFieldKey(key)}`;
+}
+
+type MetafieldKeyNode = {
+  namespace?: string | null;
+  key?: string | null;
+  type?: string | null;
+};
+
+function collectTextMetafieldKeys(
+  edges: Array<{ node?: MetafieldKeyNode | null } | null> | null | undefined,
+) {
+  return Array.from(
+    new Set(
+      (edges ?? [])
+        .map((edge) => edge?.node)
+        .filter(
+          (node): node is { namespace: string; key: string; type: string } =>
+            Boolean(
+              node?.namespace &&
+                node.key &&
+                TEXT_METAFIELD_TYPES.has(String(node.type ?? "")),
+            ),
+        )
+        .map((node) => metafieldSelectValue(String(node.namespace), String(node.key))),
+    ),
+  );
+}
+
+function mapMetafieldDefinitionOptions(
+  edges: Array<{
+    node?: {
+      name?: string | null;
+      namespace?: string | null;
+      key?: string | null;
+      type?: { name?: string | null } | null;
+    } | null;
+  } | null> | null | undefined,
+) {
+  const options: AttributePickerOption[] = [];
+  const seen = new Set<string>();
+  (edges ?? []).forEach((edge) => {
+    const node = edge?.node;
+    const namespace = String(node?.namespace ?? "").trim();
+    const key = String(node?.key ?? "").trim();
+    const name = String(node?.name ?? "").trim();
+    const typeName = String(node?.type?.name ?? "").trim();
+    if (!namespace || !key || !TEXT_METAFIELD_TYPES.has(typeName)) return;
+    const value = metafieldSelectValue(namespace, key);
+    if (seen.has(value)) return;
+    seen.add(value);
+    options.push({ value, label: `${name || key} (Metafield ${namespace}.${key})` });
+  });
+  return options;
 }
 
 function isDefaultNonAttributeOption(input: string) {
@@ -529,21 +591,7 @@ async function fetchAllDashboardProducts(admin: AdminGraphqlClient): Promise<Pro
     const page = json.data?.products;
     const edges = page?.edges ?? [];
     for (const edge of edges) {
-      const metafieldKeys = Array.from(
-        new Set(
-          (edge.node.metafields?.edges ?? [])
-            .map((metafieldEdge) => metafieldEdge?.node)
-            .filter(
-              (node): node is { namespace: string; key: string; type: string } =>
-                Boolean(
-                  node?.namespace &&
-                    node.key &&
-                    TEXT_METAFIELD_TYPES.has(String(node.type ?? "")),
-                ),
-            )
-            .map((node) => metafieldSelectValue(String(node.namespace), String(node.key))),
-        ),
-      );
+      const metafieldKeys = collectTextMetafieldKeys(edge.node.metafields?.edges);
       products.push({
         id: edge.node.id,
         numericId: edge.node.id.split("/").pop() ?? edge.node.id,
@@ -586,6 +634,15 @@ async function fetchAllDashboardCategories(admin: AdminGraphqlClient): Promise<C
                 title
                 description
               }
+              metafields(first: 50) {
+                edges {
+                  node {
+                    namespace
+                    key
+                    type
+                  }
+                }
+              }
             }
           }
         }
@@ -603,6 +660,11 @@ async function fetchAllDashboardCategories(admin: AdminGraphqlClient): Promise<C
               handle: string;
               descriptionHtml?: string | null;
               seo?: { title?: string | null; description?: string | null } | null;
+              metafields?: {
+                edges?: Array<{
+                  node?: MetafieldKeyNode | null;
+                }>;
+              } | null;
             };
           }>;
         };
@@ -619,6 +681,7 @@ async function fetchAllDashboardCategories(admin: AdminGraphqlClient): Promise<C
         description: String(edge.node.descriptionHtml ?? ""),
         seoTitle: String(edge.node.seo?.title ?? ""),
         seoDescription: String(edge.node.seo?.description ?? ""),
+        metafieldKeys: collectTextMetafieldKeys(edge.node.metafields?.edges),
       });
     }
     hasNextPage = Boolean(page?.pageInfo?.hasNextPage);
@@ -677,13 +740,39 @@ async function fetchAllProductIds(admin: AdminGraphqlClient): Promise<string[]> 
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
-  const [productResult, categoryResult, metafieldDefinitionsResult, requestsResult, cachedLanguagesResult, attributeIndexResult, localeMappingsResult] = await Promise.allSettled([
+  const [
+    productResult,
+    categoryResult,
+    metafieldDefinitionsResult,
+    collectionMetafieldDefinitionsResult,
+    requestsResult,
+    cachedLanguagesResult,
+    attributeIndexResult,
+    localeMappingsResult,
+  ] = await Promise.allSettled([
     fetchAllDashboardProducts(admin),
     fetchAllDashboardCategories(admin),
     admin.graphql(
       `#graphql
       query DashboardProductMetafieldDefinitions {
         metafieldDefinitions(first: 250, ownerType: PRODUCT) {
+          edges {
+            node {
+              name
+              namespace
+              key
+              type {
+                name
+              }
+            }
+          }
+        }
+      }`,
+    ),
+    admin.graphql(
+      `#graphql
+      query DashboardCollectionMetafieldDefinitions {
+        metafieldDefinitions(first: 250, ownerType: COLLECTION) {
           edges {
             node {
               name
@@ -706,7 +795,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   if (
     productResult.status === "rejected" ||
     categoryResult.status === "rejected" ||
-    metafieldDefinitionsResult.status === "rejected"
+    metafieldDefinitionsResult.status === "rejected" ||
+    collectionMetafieldDefinitionsResult.status === "rejected"
   ) {
     await insertTranslationLog({
       shop: session.shop,
@@ -722,6 +812,10 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         metafieldDefinitionsError:
           metafieldDefinitionsResult.status === "rejected"
             ? String(metafieldDefinitionsResult.reason)
+            : null,
+        collectionMetafieldDefinitionsError:
+          collectionMetafieldDefinitionsResult.status === "rejected"
+            ? String(collectionMetafieldDefinitionsResult.reason)
             : null,
       },
     });
@@ -759,6 +853,24 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       };
     };
   };
+  const collectionMetafieldDefinitionsJson = (
+    collectionMetafieldDefinitionsResult.status === "fulfilled"
+      ? await collectionMetafieldDefinitionsResult.value.json()
+      : { data: { metafieldDefinitions: { edges: [] } } }
+  ) as {
+    data?: {
+      metafieldDefinitions?: {
+        edges?: Array<{
+          node?: {
+            name?: string | null;
+            namespace?: string | null;
+            key?: string | null;
+            type?: { name?: string | null } | null;
+          } | null;
+        }>;
+      };
+    };
+  };
 
   const discoveredAttributeFields: AttributePickerOption[] = [];
   const seenAttributeValues = new Set<string>();
@@ -780,19 +892,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     pushAttribute(`prod_attr_name_${toFieldKey(optionName)}`, `${optionName} (Attribute Name)`);
   });
 
-  const metafieldDefs = metafieldDefinitionsJson.data?.metafieldDefinitions?.edges ?? [];
-  metafieldDefs.forEach((edge) => {
-    const node = edge.node;
-    const namespace = String(node?.namespace ?? "").trim();
-    const key = String(node?.key ?? "").trim();
-    const name = String(node?.name ?? "").trim();
-    const typeName = String(node?.type?.name ?? "").trim();
-    if (!namespace || !key || !TEXT_METAFIELD_TYPES.has(typeName)) return;
-    pushAttribute(
-      metafieldSelectValue(namespace, key),
-      `${name || key} (Metafield ${namespace}.${key})`,
-    );
-  });
+  mapMetafieldDefinitionOptions(metafieldDefinitionsJson.data?.metafieldDefinitions?.edges).forEach(
+    (entry) => pushAttribute(entry.value, entry.label),
+  );
+
+  const discoveredCategoryMetafieldFields = mapMetafieldDefinitionOptions(
+    collectionMetafieldDefinitionsJson.data?.metafieldDefinitions?.edges,
+  );
 
   let localeAccessLimited = false;
   let storeLocales: StoreLocaleRow[] = [];
@@ -837,6 +943,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     localeAccessLimited,
     requests,
     discoveredAttributeFields: attributeFields,
+    discoveredCategoryMetafieldFields,
     attributeIndexMeta: attributeIndex
       ? {
           generatedAt: attributeIndex.generatedAt,
@@ -1236,6 +1343,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
               node {
                 id
                 title
+                metafields(first: 100) {
+                  edges {
+                    node {
+                      id
+                      namespace
+                      key
+                      type
+                    }
+                  }
+                }
               }
             }
           }
@@ -1247,11 +1364,41 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       const categoryLookupJson = (await categoryLookupResponse.json()) as {
         data?: {
           collections?: {
-            edges?: Array<{ node: { id: string; title: string } }>;
+            edges?: Array<{
+              node: {
+                id: string;
+                title: string;
+                metafields?: {
+                  edges?: Array<{
+                    node?: {
+                      id?: string | null;
+                      namespace?: string | null;
+                      key?: string | null;
+                      type?: string | null;
+                    } | null;
+                  }>;
+                } | null;
+              };
+            }>;
           };
         };
       };
-      const collectionGid = categoryLookupJson.data?.collections?.edges?.[0]?.node?.id;
+      const collectionNode = categoryLookupJson.data?.collections?.edges?.[0]?.node;
+      const collectionGid = collectionNode?.id;
+      const collectionMetafields = (collectionNode?.metafields?.edges ?? [])
+        .map((edge) => edge?.node)
+        .filter(
+          (
+            node,
+          ): node is { id: string; namespace: string; key: string; type: string } =>
+            Boolean(node?.id && node.namespace && node.key),
+        )
+        .map((node) => ({
+          id: String(node.id),
+          namespace: String(node.namespace),
+          key: String(node.key),
+          type: String(node.type ?? ""),
+        }));
       if (!collectionGid) {
         return {
           ok: false,
@@ -1261,44 +1408,116 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         } satisfies ActionData;
       }
 
+      const metafieldTranslations = blocks
+        .map((block) => {
+          const key = block.key.trim().toLowerCase();
+          if (!key.startsWith("mf__")) return null;
+          const matchedMetafield = collectionMetafields.find(
+            (metafield) => metafieldSelectValue(metafield.namespace, metafield.key) === key,
+          );
+          if (!matchedMetafield) return null;
+          const value = block.value.trim();
+          if (!value) return null;
+          return {
+            id: matchedMetafield.id,
+            namespace: matchedMetafield.namespace,
+            key: matchedMetafield.key,
+            type: matchedMetafield.type,
+            value,
+          };
+        })
+        .filter(
+          (
+            entry,
+          ): entry is {
+            id: string;
+            namespace: string;
+            key: string;
+            type: string;
+            value: string;
+          } => Boolean(entry),
+        );
+
+      let appliedCategoryCore = 0;
+      let appliedCategoryMetafields = 0;
+
       if (isPrimaryLocale) {
         const input: Record<string, unknown> = { id: collectionGid };
         if (translated.title.trim()) input.title = translated.title.trim();
         if (translated.description.trim()) input.descriptionHtml = translated.description.trim();
-        if (Object.keys(input).length <= 1) {
+        if (Object.keys(input).length > 1) {
+          const updateResponse = await admin.graphql(
+            `#graphql
+            mutation CollectionUpdateFromTranslation($input: CollectionInput!) {
+              collectionUpdate(input: $input) {
+                userErrors {
+                  field
+                  message
+                }
+              }
+            }`,
+            { variables: { input } },
+          );
+          const updateJson = (await updateResponse.json()) as {
+            data?: {
+              collectionUpdate?: {
+                userErrors?: Array<{ field?: string[]; message: string }>;
+              };
+            };
+          };
+          const userErrors = updateJson.data?.collectionUpdate?.userErrors ?? [];
+          if (userErrors.length) {
+            return {
+              ok: false,
+              intent,
+              message: userErrors[0]?.message || "Failed to apply translated category content.",
+              requests: await getLocalRequestsByShop(session.shop),
+            } satisfies ActionData;
+          }
+          appliedCategoryCore = 1;
+        }
+
+        if (metafieldTranslations.length) {
+          const metafieldSetResponse = await admin.graphql(
+            `#graphql
+            mutation CategoryMetafieldsSetFromTranslation($metafields: [MetafieldsSetInput!]!) {
+              metafieldsSet(metafields: $metafields) {
+                userErrors {
+                  field
+                  message
+                }
+              }
+            }`,
+            {
+              variables: {
+                metafields: metafieldTranslations.map((entry) => ({
+                  ownerId: collectionGid,
+                  namespace: entry.namespace,
+                  key: entry.key,
+                  type: entry.type || "single_line_text_field",
+                  value: entry.value,
+                })),
+              },
+            },
+          );
+          const metafieldSetJson = (await metafieldSetResponse.json()) as {
+            data?: {
+              metafieldsSet?: {
+                userErrors?: Array<{ field?: string[]; message: string }>;
+              };
+            };
+          };
+          const metafieldErrors = metafieldSetJson.data?.metafieldsSet?.userErrors ?? [];
+          if (!metafieldErrors.length) {
+            appliedCategoryMetafields = metafieldTranslations.length;
+          }
+        }
+
+        if (!appliedCategoryCore && !appliedCategoryMetafields) {
           return {
             ok: false,
             intent,
             message: "No translated category content available to apply on default language.",
-            requests: await getLocalRequestsByShop(session.shop),
-          } satisfies ActionData;
-        }
-
-        const updateResponse = await admin.graphql(
-          `#graphql
-          mutation CollectionUpdateFromTranslation($input: CollectionInput!) {
-            collectionUpdate(input: $input) {
-              userErrors {
-                field
-                message
-              }
-            }
-          }`,
-          { variables: { input } },
-        );
-        const updateJson = (await updateResponse.json()) as {
-          data?: {
-            collectionUpdate?: {
-              userErrors?: Array<{ field?: string[]; message: string }>;
-            };
-          };
-        };
-        const userErrors = updateJson.data?.collectionUpdate?.userErrors ?? [];
-        if (userErrors.length) {
-          return {
-            ok: false,
-            intent,
-            message: userErrors[0]?.message || "Failed to apply translated category content.",
             requests: await getLocalRequestsByShop(session.shop),
           } satisfies ActionData;
         }
@@ -1348,40 +1567,111 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         pushTranslation("title", translated.title);
         pushTranslation("body_html", translated.description);
 
-        if (!translationInputs.length) {
+        if (translationInputs.length) {
+          const updateResponse = await admin.graphql(
+            `#graphql
+            mutation RegisterCategoryTranslations($resourceId: ID!, $translations: [TranslationInput!]!) {
+              translationsRegister(resourceId: $resourceId, translations: $translations) {
+                userErrors {
+                  field
+                  message
+                }
+              }
+            }`,
+            { variables: { resourceId: collectionGid, translations: translationInputs } },
+          );
+          const updateJson = (await updateResponse.json()) as {
+            data?: {
+              translationsRegister?: {
+                userErrors?: Array<{ field?: string[]; message: string }>;
+              };
+            };
+          };
+          const userErrors = updateJson.data?.translationsRegister?.userErrors ?? [];
+          if (userErrors.length) {
+            return {
+              ok: false,
+              intent,
+              message: userErrors[0]?.message || "Failed to apply translated category content.",
+              requests: await getLocalRequestsByShop(session.shop),
+            } satisfies ActionData;
+          }
+          appliedCategoryCore = translationInputs.length;
+        }
+
+        for (const metafieldTranslation of metafieldTranslations) {
+          try {
+            const metafieldTranslatableResponse = await admin.graphql(
+              `#graphql
+              query CategoryMetafieldTranslatableContent($resourceId: ID!) {
+                translatableResource(resourceId: $resourceId) {
+                  translatableContent {
+                    key
+                    digest
+                  }
+                }
+              }`,
+              { variables: { resourceId: metafieldTranslation.id } },
+            );
+            const metafieldTranslatableJson = (await metafieldTranslatableResponse.json()) as {
+              data?: {
+                translatableResource?: {
+                  translatableContent?: Array<{ key: string; digest: string }>;
+                } | null;
+              };
+            };
+            const valueDigest =
+              (metafieldTranslatableJson.data?.translatableResource?.translatableContent ?? []).find(
+                (entry) => entry.key === "value",
+              )?.digest ?? "";
+            if (!valueDigest) continue;
+
+            const metafieldUpdateResponse = await admin.graphql(
+              `#graphql
+              mutation RegisterCategoryMetafieldTranslation($resourceId: ID!, $translations: [TranslationInput!]!) {
+                translationsRegister(resourceId: $resourceId, translations: $translations) {
+                  userErrors {
+                    field
+                    message
+                  }
+                }
+              }`,
+              {
+                variables: {
+                  resourceId: metafieldTranslation.id,
+                  translations: [
+                    {
+                      key: "value",
+                      value: metafieldTranslation.value,
+                      locale: translationLocale,
+                      translatableContentDigest: valueDigest,
+                    },
+                  ],
+                },
+              },
+            );
+            const metafieldUpdateJson = (await metafieldUpdateResponse.json()) as {
+              data?: {
+                translationsRegister?: {
+                  userErrors?: Array<{ field?: string[]; message: string }>;
+                };
+              };
+            };
+            const metafieldUserErrors =
+              metafieldUpdateJson.data?.translationsRegister?.userErrors ?? [];
+            if (!metafieldUserErrors.length) {
+              appliedCategoryMetafields += 1;
+            }
+          } catch {
+            // Ignore individual metafield translation failures and continue.
+          }
+        }
+
+        if (!appliedCategoryCore && !appliedCategoryMetafields) {
           return {
             ok: false,
             intent,
             message: "No valid category fields available to register for selected locale.",
-            requests: await getLocalRequestsByShop(session.shop),
-          } satisfies ActionData;
-        }
-
-        const updateResponse = await admin.graphql(
-          `#graphql
-          mutation RegisterCategoryTranslations($resourceId: ID!, $translations: [TranslationInput!]!) {
-            translationsRegister(resourceId: $resourceId, translations: $translations) {
-              userErrors {
-                field
-                message
-              }
-            }
-          }`,
-          { variables: { resourceId: collectionGid, translations: translationInputs } },
-        );
-        const updateJson = (await updateResponse.json()) as {
-          data?: {
-            translationsRegister?: {
-              userErrors?: Array<{ field?: string[]; message: string }>;
-            };
-          };
-        };
-        const userErrors = updateJson.data?.translationsRegister?.userErrors ?? [];
-        if (userErrors.length) {
-          return {
-            ok: false,
-            intent,
-            message: userErrors[0]?.message || "Failed to apply translated category content.",
             requests: await getLocalRequestsByShop(session.shop),
           } satisfies ActionData;
         }
@@ -1393,7 +1683,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         level: "success",
         contentType: "categories",
         action: "fetch_content",
-        message: `Translated category content applied for locale ${translationLocale}.`,
+        message:
+          appliedCategoryMetafields > 0
+            ? `Translated category content applied for locale ${translationLocale}, including ${appliedCategoryMetafields} metafield(s).`
+            : `Translated category content applied for locale ${translationLocale}.`,
         requestUid,
         itemId: requestRow.itemId,
         statusCode: response.status,
@@ -1402,7 +1695,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return {
         ok: true,
         intent,
-        message: `Category translation applied for locale ${translationLocale}.`,
+        message:
+          appliedCategoryMetafields > 0
+            ? `Category translation applied for locale ${translationLocale} with ${appliedCategoryMetafields} metafield(s).`
+            : `Category translation applied for locale ${translationLocale}.`,
         requests: await getLocalRequestsByShop(session.shop),
       } satisfies ActionData;
     }
@@ -2229,6 +2525,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           handle
           descriptionHtml
           seo { title description }
+          metafields(first: 100) {
+            edges {
+              node {
+                id
+                namespace
+                key
+                value
+                type
+              }
+            }
+          }
         }
       }
     }`,
@@ -2242,6 +2549,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         handle: string;
         descriptionHtml?: string | null;
         seo?: { title?: string | null; description?: string | null } | null;
+        metafields?: {
+          edges?: Array<{
+            node?: {
+              id?: string | null;
+              namespace?: string | null;
+              key?: string | null;
+              value?: string | null;
+              type?: string | null;
+            } | null;
+          }>;
+        } | null;
       } | null>;
     };
   };
@@ -2274,13 +2592,33 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           seoDescription: String(category.seo?.description ?? ""),
           options: [] as Array<{ name: string; values: string[] }>,
           sku: "",
-          metafields: [] as Array<{
-            id: string;
-            namespace: string;
-            key: string;
-            value: string;
-            type: string;
-          }>,
+          metafields: (category.metafields?.edges ?? [])
+            .map((edge) => edge?.node)
+            .filter(
+              (
+                node,
+              ): node is {
+                id: string;
+                namespace: string;
+                key: string;
+                value: string;
+                type: string;
+              } =>
+                Boolean(
+                  node?.id &&
+                    node.namespace &&
+                    node.key &&
+                    typeof node.value === "string" &&
+                    TEXT_METAFIELD_TYPES.has(String(node.type ?? "")),
+                ),
+            )
+            .map((node) => ({
+              id: String(node.id),
+              namespace: String(node.namespace),
+              key: String(node.key),
+              value: String(node.value ?? ""),
+              type: String(node.type ?? ""),
+            })),
           contentType: "category" as const,
         }))
       : selectedProducts.map((product) => ({
@@ -2367,7 +2705,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (selectedContentType !== "category" && hasField("meta_description") && row.seoDescription.trim()) blocks.push({ key: "meta_description", name: "Meta Description", value: row.seoDescription.trim() });
     if (selectedContentType === "product" && hasField("sku") && sku.trim()) blocks.push({ key: "sku", name: "SKU", value: sku.trim() });
 
-    if (selectedContentType === "product") {
+    if (selectedContentType === "product" || selectedContentType === "category") {
       row.metafields.forEach((metafield) => {
         const selectKey = metafieldSelectValue(metafield.namespace, metafield.key);
         if (!hasField(selectKey)) return;
@@ -2525,6 +2863,7 @@ export default function DashboardRoute() {
     localeAccessLimited,
     requests: initialRequests,
     discoveredAttributeFields,
+    discoveredCategoryMetafieldFields,
     attributeIndexMeta,
   } =
     useLoaderData<typeof loader>();
@@ -2590,6 +2929,13 @@ export default function DashboardRoute() {
         : [],
     [products, selectedItems, selectedContentType],
   );
+  const selectedCategories = useMemo(
+    () =>
+      selectedContentType === "category"
+        ? categories.filter((category) => selectedItems.includes(category.id))
+        : [],
+    [categories, selectedItems, selectedContentType],
+  );
 
   const dynamicAttributes = useMemo(() => {
     const set = new Set<string>();
@@ -2607,6 +2953,15 @@ export default function DashboardRoute() {
       (field) => field.value.startsWith("mf__") && allowedKeys.has(field.value),
     );
   }, [discoveredAttributeFields, selectedProducts]);
+
+  const selectedCategoryMetafieldFields = useMemo(() => {
+    if (!selectedCategories.length) return [] as AttributePickerOption[];
+    const allowedKeys = new Set(
+      selectedCategories.flatMap((category) => category.metafieldKeys ?? []),
+    );
+    if (!allowedKeys.size) return [] as AttributePickerOption[];
+    return discoveredCategoryMetafieldFields.filter((field) => allowedKeys.has(field.value));
+  }, [discoveredCategoryMetafieldFields, selectedCategories]);
 
   const discoveredAttributeValueFields = useMemo(
     () =>
@@ -2626,6 +2981,7 @@ export default function DashboardRoute() {
         ? [
             { value: "name", label: "Category Name" },
             { value: "description", label: "Category Description" },
+            ...selectedCategoryMetafieldFields,
           ]
         : selectedContentType === "attribute_value"
           ? discoveredAttributeValueFields.length
@@ -2657,6 +3013,7 @@ export default function DashboardRoute() {
       discoveredAttributeFields,
       discoveredAttributeValueFields,
       dynamicAttributes,
+      selectedCategoryMetafieldFields,
       selectedContentType,
       selectedProductMetafieldFields,
       selectedProducts.length,
@@ -2664,7 +3021,7 @@ export default function DashboardRoute() {
   );
 
   useEffect(() => {
-    if (selectedContentType !== "product") return;
+    if (selectedContentType !== "product" && selectedContentType !== "category") return;
     const allowed = new Set(fieldOptions.map((field) => field.value));
     setSelectedFields((prev) => {
       const next = prev.filter((field) => allowed.has(field));
@@ -2918,7 +3275,9 @@ export default function DashboardRoute() {
                     ? "Select attribute fields to send for translation."
                     : selectedContentType === "attribute_value"
                       ? "Select attribute value fields to send for translation."
-                  : "Select fields to send for category translation."}
+                  : selectedCategories.length
+                    ? "Select fields to send for category translation. Text metafields appear for the selected category."
+                    : "Select a category to see its text metafields."}
               </p>
             </div>
             <s-button
