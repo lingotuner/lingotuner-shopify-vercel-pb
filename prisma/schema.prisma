@@ -80,3 +80,18 @@ model TranslationRequest {
 
   @@unique([shop, requestUid])
 }
+
+/// Per-item applied translation fields, keyed by store locale / language.
+/// appliedByLocale JSON shape: { "fr": ["title", "description"], "de": ["title"] }
+model ItemTranslationState {
+  id              Int      @id @default(autoincrement())
+  shop            String
+  contentType     String
+  itemId          String
+  appliedByLocale String   @default("{}")
+  updatedAt       DateTime @updatedAt
+  createdAt       DateTime @default(now())
+
+  @@unique([shop, contentType, itemId])
+  @@index([shop, contentType])
+}
